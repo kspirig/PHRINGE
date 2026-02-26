@@ -671,7 +671,7 @@ class PHRINGE:
 
         else:
             import astropy.units as u
-
+            print("Using Orbital Motion")
             semi_major_axis = kwargs['semi_major_axis']
             eccentricity = kwargs['eccentricity']
             inclination = kwargs['inclination']
