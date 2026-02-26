@@ -25,6 +25,30 @@ Either x_position and y_position (both float, in radians) or semi_major_axis (fl
             (float, in kg).
             """
 from astropy.constants import au, M_sun, M_earth
+print("Start")
+
+scene = Scene()
+phringe.set(scene)
+
+earth_twin = Planet(
+    name='Earth-Twin',
+    has_orbital_motion=True,  # Whether the planet is propagated in time along its orbit
+    mass=1 * u.Mearth,
+    radius=1 * u.Rearth,
+    temperature=254 * u.K,
+    semi_major_axis=1 * u.au,
+    eccentricity=0,
+    inclination=0 * u.deg,
+    raan=0 * u.deg,
+    argument_of_periapsis=135 * u.deg,
+    true_anomaly=0 * u.deg,
+    input_spectrum=None,
+    # host_star_distance=10 * u.pc,  # Is only required if no star is added explicitly to the scene
+    # host_star_mass=1 * u.Msun,  # Is only required if no star is added explicitly to the scene
+)
+
+
+scene.add_source(earth_twin)
 
 earth_twin_spectrum = phringe.get_source_spectrum('Earth-Twin').cpu().numpy()
 
