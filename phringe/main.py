@@ -1,11 +1,14 @@
 from pathlib import Path
+from time import perf_counter
 from typing import Union, overload
 
+import astropy.units as u
 import numpy as np
 import torch
 from astropy.constants.codata2018 import G
 from poliastro.bodies import Body
 from poliastro.twobody import Orbit
+from scipy.integrate import solve_ivp
 from skimage.measure import block_reduce
 from sympy import lambdify, symbols
 from torch import Tensor
@@ -651,27 +654,68 @@ class PHRINGE:
         numpy.ndarray
             Model counts.
         """
-        times = self.get_time_steps().cpu().numpy()
-        wavelength_bin_centers = self.get_wavelength_bin_centers()[:, None, None, None].cpu().numpy()
-        wavelength_bin_widths = self.get_wavelength_bin_widths()[None, :, None, None, None].cpu().numpy()
-        amplitude = self._instrument._get_amplitude(self._device).cpu().numpy()
+        total_start = perf_counter()
+        timing_enabled = bool(kwargs.pop('timing', False))
 
-        if np.array(spectral_energy_distribution).ndim == 0:
-            spectral_energy_distribution = np.array(spectral_energy_distribution)[None, None, None, None, None]
+        preprocessing_start = perf_counter()
+        cache_key = (
+            id(self._instrument),
+            id(self._observation),
+            len(self.get_time_steps()),
+            len(self.get_wavelength_bin_centers()),
+            self._instrument.number_of_inputs,
+            self._instrument.number_of_outputs,
+            float(self._observation.modulation_period),
+            float(self._observation.detector_integration_time),
+            float(self.get_nulling_baseline()),
+        )
+        model_cache = getattr(self, '_model_counts_cache', None)
+        if model_cache is None or model_cache.get('key') != cache_key:
+            times_1d = self.get_time_steps().detach().cpu().numpy().astype(np.float64, copy=False)
+            wavelength_bin_centers = self.get_wavelength_bin_centers()[:, None, None, None].detach().cpu().numpy()
+            wavelength_bin_widths = self.get_wavelength_bin_widths()[None, :, None, None, None].detach().cpu().numpy()
+            amplitude = self._instrument._get_amplitude(self._device).detach().cpu().numpy()
+            fovs = self.get_field_of_view().detach().cpu().numpy()
+
+            n_inputs = self._instrument.number_of_inputs
+            amplitude_args = tuple(amplitude for _ in range(n_inputs))
+            zero_args = tuple(0.0 for _ in range(n_inputs))
+
+            model_cache = {
+                'key': cache_key,
+                'times_1d': times_1d,
+                'times_static': times_1d[None, :, None, None],
+                'times_orbit': times_1d[None, None, :, None, None],
+                'wavelength_bin_centers': wavelength_bin_centers,
+                'wavelength_bin_widths': wavelength_bin_widths,
+                'fovs': fovs,
+                'detector_integration_time': float(self._observation.detector_integration_time),
+                'response_tail_args': (
+                    self._observation.modulation_period,
+                    self.get_nulling_baseline(),
+                    *amplitude_args,
+                    *zero_args,
+                    *zero_args,
+                    *zero_args,
+                    *zero_args,
+                ),
+            }
+            self._model_counts_cache = model_cache
+
+        if np.asarray(spectral_energy_distribution).ndim == 0:
+            spectral_energy_distribution = np.asarray(spectral_energy_distribution)[None, None, None, None, None]
         else:
-            spectral_energy_distribution = spectral_energy_distribution[None, :, None, None, None]
+            spectral_energy_distribution = np.asarray(spectral_energy_distribution)[None, :, None, None, None]
+        preprocessing_time = perf_counter() - preprocessing_start
 
-        # Check which overload is used
+        orbit_start = perf_counter()
         if 'x_position' in kwargs and 'y_position' in kwargs:
             x_position = kwargs['x_position']
             y_position = kwargs['y_position']
-            x_positions = np.array([x_position])[None, None, None, None] if x_position is not None else None
-            y_positions = np.array([y_position])[None, None, None, None] if y_position is not None else None
-            times = times[None, :, None, None]
-
+            x_positions = np.asarray([x_position], dtype=np.float64)[None, None, None, None] if x_position is not None else None
+            y_positions = np.asarray([y_position], dtype=np.float64)[None, None, None, None] if y_position is not None else None
+            times = model_cache['times_static']
         else:
-            import astropy.units as u
-            print("Using Orbital Motion")
             semi_major_axis = kwargs['semi_major_axis']
             eccentricity = kwargs['eccentricity']
             inclination = kwargs['inclination']
@@ -693,72 +737,113 @@ class PHRINGE:
                 nu=true_anomaly * u.rad
             )
 
-            x_positions = np.zeros(len(times))[None, :, None, None]
-            y_positions = np.zeros(len(times))[None, :, None, None]
+            times_1d = model_cache['times_1d']
+            n_times = len(times_1d)
+            x_positions = np.empty((1, n_times, 1, 1), dtype=np.float64)
+            y_positions = np.empty((1, n_times, 1, 1), dtype=np.float64)
 
-            for it, time in enumerate(times):
-                orbit_propagated = orbit.propagate(time * u.s)
-                x, y = (orbit_propagated.r[0].to(u.m).value, orbit_propagated.r[1].to(u.m).value)
-                x_positions[:, it] = x / host_star_distance
-                y_positions[:, it] = y / host_star_distance
+            if n_times == 1:
+                x_positions[0, 0, 0, 0] = orbit.r[0].to(u.m).value / host_star_distance
+                y_positions[0, 0, 0, 0] = orbit.r[1].to(u.m).value / host_star_distance
+            else:
+                r0 = np.asarray(orbit.r.to(u.m).value, dtype=np.float64)
+                v0 = np.asarray(orbit.v.to(u.m / u.s).value, dtype=np.float64)
+                state0 = np.concatenate((r0, v0))
+                mu = G.value * (host_star_mass + planet_mass)
 
-            times = times[None, None, :, None, None]
+                def _rhs(_t, state):
+                    pos = state[:3]
+                    pos_norm = np.linalg.norm(pos)
+                    acc = -mu * pos / (pos_norm ** 3)
+                    return np.array((state[3], state[4], state[5], acc[0], acc[1], acc[2]), dtype=np.float64)
 
-        # Check if position is outside of field of view. If so, set factor to 0 to cancel the response
-        fovs = self.get_field_of_view().cpu().numpy()
-        factors = np.ones_like(fovs)
-        x_pos = x_positions.item()
-        y_pos = y_positions.item()
-        for i, fov in enumerate(fovs):
-            if x_pos > fov / 2 or y_pos > fov / 2:
-                factors[i] = 0
+                propagation = solve_ivp(
+                    _rhs,
+                    (times_1d[0], times_1d[-1]),
+                    state0,
+                    t_eval=times_1d,
+                    method='RK45',
+                    rtol=1e-8,
+                    atol=1e-10,
+                )
+                if not propagation.success:
+                    raise RuntimeError(f'Orbit propagation failed: {propagation.message}')
 
-        # Return the corresponding counts depending on kernel usage and photon noise inclusion
+                x_positions[0, :, 0, 0] = propagation.y[0] / host_star_distance
+                y_positions[0, :, 0, 0] = propagation.y[1] / host_star_distance
+
+            times = model_cache['times_orbit']
+        orbit_time = perf_counter() - orbit_start
+
+        instrument_start = perf_counter()
+        response_tail_args = model_cache['response_tail_args']
         if kernels:
             diff_ir = np.concatenate([self._instrument._diff_ir_numpy[i](
                 times,
-                wavelength_bin_centers,
+                model_cache['wavelength_bin_centers'],
                 x_positions,
                 y_positions,
-                self._observation.modulation_period,
-                self.get_nulling_baseline(),
-                *[amplitude for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)]
+                *response_tail_args
             ) for i in range(self._instrument.kernels.shape[0])])
-
-            diff_counts = (diff_ir
-                           * spectral_energy_distribution
-                           * self._observation.detector_integration_time
-                           * wavelength_bin_widths
-                           * factors[None, :, None, None, None]
-                           )
-
-            return diff_counts[:, :, :, 0, 0]
         else:
             ir = np.concatenate([self._instrument._ir_numpy[i](
                 times,
-                wavelength_bin_centers,
+                model_cache['wavelength_bin_centers'],
                 x_positions,
                 y_positions,
-                self._observation.modulation_period,
-                self.get_nulling_baseline(),
-                *[amplitude for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)],
-                *[0 for _ in range(self._instrument.number_of_inputs)]
+                *response_tail_args
             ) for i in range(self._instrument.number_of_outputs)])
+        instrument_time = perf_counter() - instrument_start
 
-            counts = (ir
-                      * spectral_energy_distribution
-                      * self._observation.detector_integration_time
-                      * wavelength_bin_widths
-                      * factors[None, :, None, None, None]
-                      )
-            return counts[:, :, :, 0, 0]
+        assembly_start = perf_counter()
+        if x_positions is None or y_positions is None:
+            factors = np.ones_like(model_cache['fovs'])
+        else:
+            max_abs_position = max(
+                float(np.abs(np.asarray(x_positions)).max()),
+                float(np.abs(np.asarray(y_positions)).max())
+            )
+            factors = (max_abs_position <= (model_cache['fovs'] / 2)).astype(model_cache['fovs'].dtype, copy=False)
+
+        if kernels:
+            diff_counts = (
+                    diff_ir
+                    * spectral_energy_distribution
+                    * model_cache['detector_integration_time']
+                    * model_cache['wavelength_bin_widths']
+                    * factors[None, :, None, None, None]
+            )
+            result = diff_counts[:, :, :, 0, 0]
+        else:
+            counts = (
+                    ir
+                    * spectral_energy_distribution
+                    * model_cache['detector_integration_time']
+                    * model_cache['wavelength_bin_widths']
+                    * factors[None, :, None, None, None]
+            )
+            result = counts[:, :, :, 0, 0]
+        final_assembly_time = perf_counter() - assembly_start
+
+        total_time = perf_counter() - total_start
+        self._last_model_counts_timing = {
+            'preprocessing_overhead_s': preprocessing_time,
+            'orbit_propagation_s': orbit_time,
+            'instrument_response_s': instrument_time,
+            'final_count_assembly_s': final_assembly_time,
+            'total_s': total_time,
+        }
+        if timing_enabled:
+            print(
+                f"get_model_counts timings [s] "
+                f"prep={preprocessing_time:.6f}, "
+                f"orbit={orbit_time:.6f}, "
+                f"instrument={instrument_time:.6f}, "
+                f"assembly={final_assembly_time:.6f}, "
+                f"total={total_time:.6f}"
+            )
+
+        return result
 
     def get_null_depth(self) -> Tensor:
         """Return the null depth as an array of shape (n_diff_out x n_wavelengths x n_time_steps).

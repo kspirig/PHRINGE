@@ -101,6 +101,8 @@ class Planet(BaseSource):
     _angular_separation_from_star_x: Any = None
     _angular_separation_from_star_y: Any = None
     _simulation_time_steps: Any = None
+    _cached_sky_coordinates: Any = None
+    _cached_sky_brightness_distribution: Any = None
 
     @field_validator('argument_of_periapsis')
     def _validate_argument_of_periapsis(cls, value: Any, info: ValidationInfo) -> float:
@@ -209,15 +211,19 @@ class Planet(BaseSource):
         :param context: The context
         :return: The sky brightness distribution
         """
+        if self._cached_sky_brightness_distribution is not None:
+            return self._cached_sky_brightness_distribution
+
         number_of_wavelength_steps = len(self._phringe._instrument.wavelength_bin_centers)
 
         if self.has_orbital_motion:
+            sky_coordinates_all = self._sky_coordinates
             sky_brightness_distribution = torch.zeros(
-                (len(self._sky_coordinates[1]), number_of_wavelength_steps, self._phringe._grid_size,
+                (len(sky_coordinates_all[1]), number_of_wavelength_steps, self._phringe._grid_size,
                  self._phringe._grid_size),
                 device=self._phringe._device)
-            for index_time in range(len(self._sky_coordinates[1])):
-                sky_coordinates = self._sky_coordinates[:, index_time]
+            for index_time in range(len(sky_coordinates_all[1])):
+                sky_coordinates = sky_coordinates_all[:, index_time]
                 index_x = get_index_of_closest_value(
                     sky_coordinates[0, :, 0],
                     self._angular_separation_from_star_x[index_time]
@@ -228,39 +234,72 @@ class Planet(BaseSource):
                 )
                 sky_brightness_distribution[index_time, :, index_x, index_y] = self._spectral_energy_distribution
         elif self.grid_position:
+            sky_coordinates = self._sky_coordinates
             sky_brightness_distribution = torch.zeros(
                 (number_of_wavelength_steps, self._phringe._grid_size, self._phringe._grid_size),
                 device=self._phringe._device)
             sky_brightness_distribution[:, self.grid_position[1],
             self.grid_position[0]] = self._spectral_energy_distribution
-            self._angular_separation_from_star_x = self._sky_coordinates[
+            self._angular_separation_from_star_x = sky_coordinates[
                 0, self.grid_position[1], self.grid_position[0]]
-            self._angular_separation_from_star_y = self._sky_coordinates[
+            self._angular_separation_from_star_y = sky_coordinates[
                 1, self.grid_position[1], self.grid_position[0]]
         else:
+            sky_coordinates = self._sky_coordinates
             sky_brightness_distribution = torch.zeros(
                 (number_of_wavelength_steps, self._phringe._grid_size, self._phringe._grid_size),
                 device=self._phringe._device)
             # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             index_x = get_index_of_closest_value(
-                torch.asarray(self._sky_coordinates[0, :, 0], device=self._phringe._device),
+                torch.asarray(sky_coordinates[0, :, 0], device=self._phringe._device),
                 self._angular_separation_from_star_x[0])
             index_y = get_index_of_closest_value(
-                torch.asarray(self._sky_coordinates[1, 0, :], device=self._phringe._device),
+                torch.asarray(sky_coordinates[1, 0, :], device=self._phringe._device),
                 self._angular_separation_from_star_y[0])
             sky_brightness_distribution[:, index_x, index_y] = self._spectral_energy_distribution
+        self._cached_sky_brightness_distribution = sky_brightness_distribution
         return sky_brightness_distribution
 
     @property
     def _sky_coordinates(self) -> Union[Tensor, None]:
+        if self._cached_sky_coordinates is not None:
+            return self._cached_sky_coordinates
+
         self._angular_separation_from_star_x = torch.zeros(len(self._phringe.simulation_time_steps),
                                                            device=self._phringe._device)
         self._angular_separation_from_star_y = torch.zeros(len(self._phringe.simulation_time_steps),
                                                            device=self._phringe._device)
+        self._has_precomputed_angular_separations = False
 
         # If planet motion is being considered, then the sky coordinates may change with each time step and thus
         # coordinates are created for each time step, rather than just once
         if self.has_orbital_motion:
+            host_star_distance = self.host_star_distance if self.host_star_distance is not None else self._phringe._scene.star.distance
+            host_star_mass = self.host_star_mass if self.host_star_mass is not None else self._phringe._scene.star.mass
+            star = Body(parent=None, k=G * (host_star_mass + self.mass) * u.kg, name='Star')
+            orbit = Orbit.from_classical(
+                star,
+                a=self.semi_major_axis * u.m,
+                ecc=u.Quantity(self.eccentricity),
+                inc=self.inclination * u.rad,
+                raan=self.raan * u.rad,
+                argp=self.argument_of_periapsis * u.rad,
+                nu=self.true_anomaly * u.rad
+            )
+            times = self._phringe.simulation_time_steps.detach().cpu().numpy()
+            x_vals = np.empty(len(times), dtype=np.float64)
+            y_vals = np.empty(len(times), dtype=np.float64)
+            for idx, t in enumerate(times):
+                orbit_propagated = orbit.propagate(t * u.s)
+                x_vals[idx] = orbit_propagated.r[0].to(u.m).value
+                y_vals[idx] = orbit_propagated.r[1].to(u.m).value
+            self._angular_separation_from_star_x = torch.asarray(
+                x_vals / host_star_distance, dtype=torch.float32, device=self._phringe._device
+            )
+            self._angular_separation_from_star_y = torch.asarray(
+                y_vals / host_star_distance, dtype=torch.float32, device=self._phringe._device
+            )
+            self._has_precomputed_angular_separations = True
             sky_coordinates = torch.zeros(
                 (2, len(self._phringe.simulation_time_steps), self._phringe._grid_size, self._phringe._grid_size),
                 device=self._phringe._device
@@ -270,9 +309,11 @@ class Planet(BaseSource):
                     time_step.item(),
                     index_time,
                 )
+            self._cached_sky_coordinates = sky_coordinates
             return sky_coordinates
         else:
-            return self._get_coordinates(self._phringe.simulation_time_steps[0], 0)
+            self._cached_sky_coordinates = self._get_coordinates(self._phringe.simulation_time_steps[0], 0)
+            return self._cached_sky_coordinates
 
     @property
     def _solid_angle(self):
@@ -322,9 +363,10 @@ class Planet(BaseSource):
         :param star_mass: The mass of the star
         :return: The sky coordinates
         """
-        self._angular_separation_from_star_x[index_time], self._angular_separation_from_star_y[index_time] = (
-            self._get_x_y_angular_separation_from_star(time_step)
-        )
+        if not self._has_precomputed_angular_separations:
+            self._angular_separation_from_star_x[index_time], self._angular_separation_from_star_y[index_time] = (
+                self._get_x_y_angular_separation_from_star(time_step)
+            )
 
         angular_radius = torch.sqrt(
             self._angular_separation_from_star_x[index_time] ** 2
@@ -363,6 +405,7 @@ class Planet(BaseSource):
         :param star_mass: The mass of the star
         :return: A tuple containing the x- and y- coordinates
         """
+        print("Uses Kimi Changes")
         host_star_mass = self.host_star_mass if self.host_star_mass is not None else self._phringe._scene.star.mass
         star = Body(parent=None, k=G * (host_star_mass + self.mass) * u.kg, name='Star')
         orbit = Orbit.from_classical(star, a=self.semi_major_axis * u.m, ecc=u.Quantity(self.eccentricity),
