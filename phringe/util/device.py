@@ -24,15 +24,19 @@ import torch
 
 
 def get_device(gpu: int) -> torch.device:
-    """Get the device.
+    """Return the requested CUDA device, or CPU when no GPU is requested."""
+    if gpu is None:
+        return torch.device("cpu")
 
-    :param gpu: The GPU
-    :return: The device
-    """
-    if gpu and torch.cuda.is_available() and torch.cuda.device_count():
-        if torch.max(torch.asarray(gpu)) > torch.cuda.device_count():
-            raise ValueError(f'GPU number {torch.max(torch.asarray(gpu))} is not available on this machine.')
-        device = torch.device(f'cuda:{gpu}')
-    else:
-        device = torch.device('cpu')
-    return device
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    device_count = torch.cuda.device_count()
+
+    if gpu < 0 or gpu >= device_count:
+        raise ValueError(
+            f"GPU number {gpu} is not available. "
+            f"Valid GPU indices are 0 to {device_count - 1}."
+        )
+
+    return torch.device(f"cuda:{gpu}")
